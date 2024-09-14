@@ -1,0 +1,194 @@
+`include "decap.v"
+module Calculator(
+  input wire clock, reset, newkey, 
+  input wire [4:0]keycode,
+  output reg signed [19:0] magX, // magnitude of X
+  output reg signX, // sign of X
+  output wire [4:0] of_flash // overflow warning
+);
+  
+  // internal signals
+  
+  reg [40:0] result, MultMag;
+  reg signed [20:0] X, newX, Y, nextY, M, nextM, AddMag; // 1 bit larger to allow for the sign bit and for AddMag to add the largest possible positive numbers
+  reg [3:0] operator, Op, nextOp, LastPressed, nextLastPressed;
+  reg OverFlow, isEquals, next_isEquals;
+  
+  wire [39:0] Square;
+  wire signed [20:0] nextX, Minus, negX;
+  wire[3:0] hex;
+  wire op_pressed, num_pressed, updated;
+  
+  
+  // assign decap signals
+  decap dp(
+    .clock(clock),
+    .reset(reset),
+    .newkey(newkey), 
+    .keycode(keycode),
+    .num_pressed(num_pressed), 
+    .op_pressed(op_pressed), 
+    .operator(operator), 
+    .hex(hex)
+  );
+  
+  always @ (posedge clock)
+    begin
+      if (reset)
+        begin
+          X <= 0;
+          Y <= 0;
+          M <= 0;
+          Op <= 0;
+          LastPressed <= 0;
+          isEquals <= 0;
+        end
+      else
+        begin
+          if (operator == 4'd5)
+            begin
+              if (X == 0)
+                begin
+                  Y <= 0;
+                  Op <= 0;
+                end
+              else X <= 0;
+            end
+          else 
+            begin
+              X <= nextX;
+              Y <= nextY;
+              Op <= nextOp;
+            end
+          M <= nextM;
+          LastPressed <= nextLastPressed;
+          isEquals <= next_isEquals;
+        end
+    end
+
+  assign Minus = -1*X;	//sign change
+  assign Square = X*X;  //square assignment
+  assign negX = {Minus[15:0], hex};	// for number input if X is in minus form
+      
+
+    // multiplexer to see if equals is currently selected
+  always @ (operator, reset, isEquals)
+    begin
+    if (reset) next_isEquals = 0;
+  	else
+      case(operator)
+        4'd4: next_isEquals = 1;
+        4'd0: next_isEquals = isEquals;
+        default: next_isEquals = 0;
+      endcase
+    end
+  
+  
+  // result multiplexor
+  always @ (Op, X, Y)
+    begin
+      case(Op)
+        4'd0: result = X;   // if no operator then result is X
+        4'd1: result = X+Y; // plus operator 
+        4'd3: result = X*Y; // multiply operator
+        default result = 0; // otherwise result is 0
+      endcase
+    end
+
+  // big X multiplexor
+  always @ (operator, X, M, result, Minus, Square, num_pressed, hex)
+    begin
+      case(num_pressed)
+        1'b1: newX = X[20]?(-1*negX):{1'b0,X[15:0], hex};	
+        1'b0: begin
+          case(operator)
+            4'd2: newX = Minus;
+            4'd4: if(~OverFlow) newX = result;else newX=0;
+            4'd5: newX = 0;
+            4'd6: if(Square[39:21] == 0) newX = Square; else newX = 0;
+            4'd8: newX = M;
+            default newX = X;
+          endcase
+        end
+      endcase
+    end
+  
+  // Y multiplexor
+  always @ (operator, X, Y)
+    begin
+      case(operator)
+        4'd1, 4'd3: nextY = X;
+        4'd4: if (isEquals) nextY = Y; else nextY = X; // equals
+        4'd5: if (X==0) nextY = 0; else nextY = Y;
+        default nextY = Y;
+      endcase
+    end
+  
+  // Op multiplexor
+  always @ (operator, Op)
+    begin
+      case (operator)
+        4'd1, 4'd3: nextOp = operator;
+        4'd5: if (X==0) nextOp = 0; else nextOp = Op;
+        default: nextOp = Op;
+      endcase
+    end
+
+  // M multiplexor
+  always @ (operator, X, M)
+    begin
+      case (operator)
+        4'd7: nextM = X;
+        default nextM = M;
+      endcase
+    end
+  
+  // LastPressed Tracker (Plus, Multiply and Equals only need to be tracked)
+  always @ (operator, LastPressed, hex)
+    begin
+      if ((operator == 4'd1)||(operator ==  4'd3)||(operator ==  4'd4)) nextLastPressed = 1;
+      else if (LastPressed&&num_pressed) nextLastPressed = 0;
+      else nextLastPressed = LastPressed;
+    end
+
+  // multiplexors that play a part in numerical input into the X register form keypad
+  assign updated = LastPressed ? num_pressed:0;
+  assign nextX = updated?{17'b0, hex}:newX;
+  
+  //Overflow detection for plus and multiply
+  always @ (result, Op, X, Y)
+    begin
+      case(Op)
+        4'd1:begin	// addition case
+          if(X[20] == Y[20]) // same sign check
+            begin
+              if (X[20]) AddMag = (-1*X)+(-1*Y);	// If negative, flip signs then add
+              else AddMag = X+Y;	// if positive, then just add
+              if (AddMag[20] != 1'b0) OverFlow = 1;	// check for overflow in absolute val
+              else OverFlow = 0;
+            end
+          else OverFlow = 0;	// Opposing signs in addition won't ever exceed capacity
+        end
+        4'd3:begin	// multiplication case
+          if(X[20] == Y[20]) 	// check if same sign
+            begin
+              if (result[40:21] != 1'b0) OverFlow = 1;	//if same sign, then just multiply
+              else OverFlow = 0;
+            end
+          else 
+            begin
+              MultMag = -1*X*Y;	// if different signs, then multiply by -1 then check
+              if (MultMag[40:21] != 1'b0) OverFlow = 1;
+              else OverFlow = 0;
+            end
+        end
+        default: OverFlow = 0;
+      endcase
+    end
+
+  // assigning X register and overflow to outputs of the module
+  assign magX = X[20]? -1*X[19:0]:X[19:0];
+  assign signX = X[20];
+  assign of_flash = {OverFlow, OverFlow, OverFlow, OverFlow, OverFlow};
+
+endmodule
